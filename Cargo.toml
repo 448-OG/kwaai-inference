@@ -1,0 +1,56 @@
+[package]
+name = "kwaai-inference"
+version = "0.5.4"
+authors = ["Kwaai AI Lab <dev@kwaai.ai>"]
+edition = "2021"
+description = "Inference engine for KwaaiNet - Candle-based ML runtime"
+repository = "https://github.com/Kwaai-AI-Lab/KwaaiNet"
+license = "MIT"
+keywords = ["candle", "gguf", "inference", "ml", "transformers"]
+
+[[bench]]
+harness = false
+name = "inference_bench"
+
+[dependencies]
+async-trait = { version = "0.1.91" }
+# Async
+tokio = { version = "1.53.1" }
+
+# ML
+candle-core = { version = "0.11.0" }
+candle-flash-attn = { version = "0.11.0", optional = true }
+candle-nn = { version = "0.11.0" }
+candle-transformers = { version = "0.11.0" }
+half = { version = "2.7.1" }
+tokenizers = { version = "0.23.1" }
+
+# Serialization
+serde = { version = "1.0.229" }
+serde_json = { version = "1.0.151" }
+
+anyhow = { version = "1.0.104" }
+# Error handling
+thiserror = { version = "2.0.19" }
+
+# Logging
+tracing = { version = "0.1.44" }
+
+[dev-dependencies]
+criterion = { version = "0.8.2" }
+dirs = "6"
+safetensors = "0.8.0"
+tokio-test = "0.4"
+tracing-subscriber = { version = "0.3.23" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mlx-rs = { version = "0.25", features = ["safetensors"], optional = true }
+safetensors = { version = "0.8.0", optional = true }
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-flash-attn", "cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+mlx = ["mlx-rs", "safetensors"]
