@@ -311,10 +311,13 @@ impl InferenceProvider for InferenceEngine {
 
         self.check_memory(estimated_memory)?;
 
+        let mut chat_template = Option::<String>::default();
+
         // ── Dispatch to the real loader ──────────────────────────────────────
         let (weights, config, vocab_size, _num_layers, is_quantized) = match format {
             ModelFormat::Gguf | ModelFormat::Ggml => {
-                let m = loader::load_gguf(path, &self.device)?;
+                let (m, chat_template_inner) = loader::load_gguf(path, &self.device)?;
+                chat_template = chat_template_inner;
                 let c = m.config.clone();
                 let v = m.vocab_size;
                 let l = m.num_layers;
@@ -376,6 +379,7 @@ impl InferenceProvider for InferenceEngine {
             context_length: config.max_seq_len,
             hidden_dim: config.hidden_dim,
             is_quantized,
+            chat_template,
             ..Default::default()
         };
 

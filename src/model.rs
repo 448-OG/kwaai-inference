@@ -85,6 +85,9 @@ pub struct ModelInfo {
     /// Hidden dimension (embedding size per token).
     /// Used by the Petals throughput formula: network_rps = bandwidth / (hidden_dim × 16 bits).
     pub hidden_dim: usize,
+
+    /// Chat template from GGUF.
+    pub chat_template: Option<String>,
 }
 
 impl Default for ModelInfo {
@@ -101,6 +104,7 @@ impl Default for ModelInfo {
             vocab_size: 0,
             context_length: 0,
             hidden_dim: 0,
+            chat_template: Option::default(),
         }
     }
 }
