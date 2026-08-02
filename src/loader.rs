@@ -10,7 +10,6 @@ use crate::{
     ModelConfig,
 };
 use candle_core::{quantized::gguf_file, Device, Tensor};
-use candle_transformers::models::quantized_qwen3;
 use std::path::Path;
 use tracing::info;
 
@@ -58,8 +57,10 @@ pub struct GgufModel {
 ///
 /// Reads `general.architecture` from the GGUF metadata to pick the right
 /// weight loader, then extracts architecture config and loads real weights.
-pub fn load_gguf(path: &Path, device: &Device) -> InferenceResult<GgufModel> {
-    use candle_transformers::models::{quantized_gemma3, quantized_llama, quantized_qwen2};
+pub fn load_gguf(path: &Path, device: &Device) -> InferenceResult<(GgufModel, Option<String>)> {
+    use candle_transformers::models::{
+        quantized_gemma3, quantized_llama, quantized_qwen2, quantized_qwen3,
+    };
 
     let mut file = std::fs::File::open(path).map_err(|e| {
         InferenceError::ModelLoadError(format!("Cannot open {}: {e}", path.display()))
@@ -71,6 +72,13 @@ pub fn load_gguf(path: &Path, device: &Device) -> InferenceResult<GgufModel> {
             path.display()
         ))
     })?;
+
+    let chat_template = gguf
+        .metadata
+        .get("tokenizer.chat_template")
+        .map(|value| value.to_string().cloned())
+        .transpose()
+        .unwrap_or_default();
 
     // Detect architecture from the GGUF general metadata.
     let arch = meta_str(&gguf, "general.architecture").unwrap_or_else(|| "llama".to_string());
@@ -147,13 +155,16 @@ pub fn load_gguf(path: &Path, device: &Device) -> InferenceResult<GgufModel> {
             }
         };
 
-    Ok(GgufModel {
-        weights,
-        config,
-        vocab_size,
-        num_layers,
-        tokenizer,
-    })
+    Ok((
+        GgufModel {
+            weights,
+            config,
+            vocab_size,
+            num_layers,
+            tokenizer,
+        },
+        chat_template,
+    ))
 }
 
 // ── SafeTensors ───────────────────────────────────────────────────────────────
