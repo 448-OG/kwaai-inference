@@ -43,18 +43,23 @@ pub mod mlx_shard;
 pub use config::EngineConfig;
 pub use engine::InferenceEngine;
 pub use error::{InferenceError, InferenceResult};
+use futures_lite::Stream;
 pub use model::{ModelFormat, ModelHandle, ModelInfo};
 pub use shard::{ShardConfig, TransformerShard};
 
-use async_trait::async_trait;
 use candle_core::Tensor;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{future::Future, path::Path};
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum InferenceStream {
+    Text(String),
+    Finished(String),
+}
 
 /// Core trait for inference operations
 ///
 /// Implementors provide the ability to load models and run inference.
-#[async_trait]
 pub trait InferenceProvider: Send + Sync {
     /// Load a model from the given path
     fn load_model(&mut self, path: &Path, format: ModelFormat) -> InferenceResult<ModelHandle>;
@@ -63,7 +68,11 @@ pub trait InferenceProvider: Send + Sync {
     fn forward(&self, handle: &ModelHandle, input: &Tensor) -> InferenceResult<Tensor>;
 
     /// Generate text from a prompt
-    fn generate(&self, handle: &ModelHandle, prompt: &str) -> InferenceResult<String>;
+    fn generate(
+        &self,
+        handle: &ModelHandle,
+        prompt: &str,
+    ) -> impl Future<Output = impl Stream<Item = InferenceResult<InferenceStream>> + Send>;
 
     /// Unload a model to free memory
     fn unload(&mut self, handle: ModelHandle) -> InferenceResult<()>;
