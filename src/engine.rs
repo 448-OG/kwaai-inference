@@ -8,14 +8,18 @@ use crate::{
     tokenizer::Tokenizer,
     InferenceProvider, ModelConfig,
 };
-use async_trait::async_trait;
+use async_dup::Arc;
+use async_lock::Mutex;
+use async_stream::try_stream;
 use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::llama::Cache;
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use futures_lite::Stream;
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tracing::{debug, info};
 
 // ── Loaded weights ────────────────────────────────────────────────────────────
@@ -29,9 +33,9 @@ use tracing::{debug, info};
 #[allow(dead_code)]
 enum LoadedWeights {
     /// Quantized model from a GGUF file (Q4_K_M, Q5_K_M, …)
-    Gguf(Mutex<GgufModel>),
+    Gguf(Arc<Mutex<GgufModel>>),
     /// Full-precision model from SafeTensors shards (F16 / F32)
-    SafeTensors(Mutex<SafeTensorsModel>),
+    SafeTensors(Arc<Mutex<SafeTensorsModel>>),
 }
 
 struct LoadedModelEntry {
@@ -126,7 +130,7 @@ impl InferenceEngine {
     /// performance.
     /// Pass 2 (measurement, `n_steps` steps): timed; result stored in
     /// `last_decode_tps` and returned.
-    pub fn benchmark(&self, handle: &ModelHandle, n_steps: usize) -> InferenceResult<f64> {
+    pub async fn benchmark(&self, handle: &ModelHandle, n_steps: usize) -> InferenceResult<f64> {
         const WARMUP_STEPS: usize = 5;
         const BENCH_PROMPT: &str = "The sky is";
 
@@ -139,7 +143,7 @@ impl InferenceEngine {
 
         let tps = match &entry.weights {
             LoadedWeights::Gguf(m) => {
-                let mut guard = m.lock().unwrap();
+                let mut guard = m.lock().await;
 
                 let mut prompt_tokens = guard.tokenizer.encode(BENCH_PROMPT)?;
                 if let Some(bos) = guard.tokenizer.bos_token_id() {
@@ -199,7 +203,7 @@ impl InferenceEngine {
             }
 
             LoadedWeights::SafeTensors(m) => {
-                let guard = m.lock().unwrap();
+                let guard = m.lock().await;
 
                 let mut prompt_tokens = guard.tokenizer.encode(BENCH_PROMPT)?;
                 if let Some(bos) = guard.tokenizer.bos_token_id() {
@@ -263,7 +267,6 @@ impl InferenceEngine {
 
 // ── InferenceProvider impl ────────────────────────────────────────────────────
 
-#[async_trait]
 impl InferenceProvider for InferenceEngine {
     fn load_model(&mut self, path: &Path, format: ModelFormat) -> InferenceResult<ModelHandle> {
         let file_name = path
@@ -321,7 +324,7 @@ impl InferenceProvider for InferenceEngine {
                 let c = m.config.clone();
                 let v = m.vocab_size;
                 let l = m.num_layers;
-                (LoadedWeights::Gguf(Mutex::new(m)), c, v, l, true)
+                (LoadedWeights::Gguf(Arc::new(Mutex::new(m))), c, v, l, true)
             }
 
             ModelFormat::SafeTensors => {
@@ -349,7 +352,13 @@ impl InferenceProvider for InferenceEngine {
                     let c = m.config.clone();
                     let v = m.vocab_size;
                     let l = m.num_layers;
-                    (LoadedWeights::SafeTensors(Mutex::new(m)), c, v, l, false)
+                    (
+                        LoadedWeights::SafeTensors(Arc::new(Mutex::new(m))),
+                        c,
+                        v,
+                        l,
+                        false,
+                    )
                 } else {
                     // Single-shard: config.json must sit alongside the .safetensors file.
                     let config_path = path.parent().unwrap_or(Path::new(".")).join("config.json");
@@ -358,7 +367,13 @@ impl InferenceProvider for InferenceEngine {
                     let c = m.config.clone();
                     let v = m.vocab_size;
                     let l = m.num_layers;
-                    (LoadedWeights::SafeTensors(Mutex::new(m)), c, v, l, false)
+                    (
+                        LoadedWeights::SafeTensors(Arc::new(Mutex::new(m))),
+                        c,
+                        v,
+                        l,
+                        false,
+                    )
                 }
             }
 
@@ -424,228 +439,236 @@ impl InferenceProvider for InferenceEngine {
         ))
     }
 
-    fn generate(&self, handle: &ModelHandle, prompt: &str) -> InferenceResult<String> {
-        /// Maximum new tokens to generate per call.
-        const MAX_NEW_TOKENS: usize = 256;
-        /// Sampling temperature (0 → greedy, higher → more random).
-        const TEMPERATURE: f64 = 0.8;
+    async fn generate(
+        &self,
+        handle: &ModelHandle,
+        prompt: &str,
+    ) -> impl Stream<Item = InferenceResult<crate::InferenceStream>> + Send {
+        try_stream! {
+            /// Maximum new tokens to generate per call.
+            const MAX_NEW_TOKENS: usize = 256;
+            /// Sampling temperature (0 → greedy, higher → more random).
+            const TEMPERATURE: f64 = 0.8;
 
-        let entry = self
-            .models
-            .get(&handle.id())
-            .ok_or(InferenceError::InvalidHandle(handle.id()))?;
+            let entry = self
+                .models
+                .get(&handle.id())
+                .ok_or(InferenceError::InvalidHandle(handle.id()))?;
 
-        let mut logits_processor = LogitsProcessor::new(42, Some(TEMPERATURE), None);
+            let mut logits_processor = LogitsProcessor::new(42, Some(TEMPERATURE), None);
 
-        let text = match &entry.weights {
-            // ── Quantized GGUF path ───────────────────────────────────────────
-            LoadedWeights::Gguf(m) => {
-                let mut guard = m.lock().unwrap();
+            match &entry.weights {
+                // ── Quantized GGUF path ───────────────────────────────────────────
+                LoadedWeights::Gguf(m) => {
+                    let mut guard = m.lock().await;
 
-                // Encode prompt.
-                let mut prompt_tokens = guard.tokenizer.encode(prompt)?;
-                let eos_id = guard.tokenizer.eos_token_id();
-                let bos_id = guard.tokenizer.bos_token_id();
+                    // Encode prompt.
+                    let mut prompt_tokens = guard.tokenizer.encode(prompt)?;
+                    let eos_id = guard.tokenizer.eos_token_id();
+                    let bos_id = guard.tokenizer.bos_token_id();
 
-                // Prepend BOS only when it is a distinct token from EOS.
-                // Models like Qwen2 set BOS == EOS (both are <|endoftext|>=151643);
-                // prepending EOS as BOS causes the model to immediately terminate.
-                if let Some(bos) = bos_id {
-                    if Some(bos) != eos_id {
-                        prompt_tokens.insert(0, bos);
-                    }
-                }
-                let prompt_len = prompt_tokens.len();
-
-                // Build the full stop-token set: the registered EOS plus common
-                // ChatML/instruct stop tokens that the vocab may contain.
-                let mut stop_ids: Vec<u32> = eos_id.into_iter().collect();
-                for candidate in &["<|im_end|>", "<|eot_id|>", "<|end_of_text|>"] {
-                    if let Some(id) = guard.tokenizer.token_to_id(candidate) {
-                        if !stop_ids.contains(&id) {
-                            stop_ids.push(id);
+                    // Prepend BOS only when it is a distinct token from EOS.
+                    // Models like Qwen2 set BOS == EOS (both are <|endoftext|>=151643);
+                    // prepending EOS as BOS causes the model to immediately terminate.
+                    if let Some(bos) = bos_id {
+                        if Some(bos) != eos_id {
+                            prompt_tokens.insert(0, bos);
                         }
                     }
-                }
+                    let prompt_len = prompt_tokens.len();
 
-                info!(
-                    "generate() GGUF handle {}: {} prompt tokens, stop={:?}",
-                    handle.id(),
-                    prompt_len,
-                    stop_ids,
-                );
-
-                // Prefill: process the entire prompt in one forward pass.
-                // index_pos=0 resets the model's internal KV-cache.
-                let prompt_tensor = Tensor::new(prompt_tokens.as_slice(), &self.device)
-                    .map_err(InferenceError::from)?
-                    .unsqueeze(0)
-                    .map_err(InferenceError::from)?; // [1, prompt_len]
-
-                let logits = guard
-                    .weights
-                    .forward(&prompt_tensor, 0)
-                    .map_err(InferenceError::from)?; // [1, vocab_size]
-                let logits = logits.squeeze(0).map_err(InferenceError::from)?; // [vocab_size]
-
-                let mut next_token = logits_processor
-                    .sample(&logits)
-                    .map_err(InferenceError::from)?;
-
-                let mut generated: Vec<u32> = Vec::new();
-                let mut pos = prompt_len;
-
-                // Decode loop: feed one token at a time, sample the next.
-                let decode_start = std::time::Instant::now();
-                loop {
-                    if stop_ids.contains(&next_token) || generated.len() >= MAX_NEW_TOKENS {
-                        break;
+                    // Build the full stop-token set: the registered EOS plus common
+                    // ChatML/instruct stop tokens that the vocab may contain.
+                    let mut stop_ids: Vec<u32> = eos_id.into_iter().collect();
+                    for candidate in &["<|im_end|>", "<|eot_id|>", "<|end_of_text|>"] {
+                        if let Some(id) = guard.tokenizer.token_to_id(candidate) {
+                            if !stop_ids.contains(&id) {
+                                stop_ids.push(id);
+                            }
+                        }
                     }
-                    generated.push(next_token);
 
-                    let token_tensor = Tensor::new(&[next_token], &self.device)
+                    info!(
+                        "generate() GGUF handle {}: {} prompt tokens, stop={:?}",
+                        handle.id(),
+                        prompt_len,
+                        stop_ids,
+                    );
+
+                    // Prefill: process the entire prompt in one forward pass.
+                    // index_pos=0 resets the model's internal KV-cache.
+                    let prompt_tensor = Tensor::new(prompt_tokens.as_slice(), &self.device)
                         .map_err(InferenceError::from)?
                         .unsqueeze(0)
-                        .map_err(InferenceError::from)?; // [1, 1]
+                        .map_err(InferenceError::from)?; // [1, prompt_len]
 
                     let logits = guard
                         .weights
-                        .forward(&token_tensor, pos)
-                        .map_err(InferenceError::from)?;
-                    let logits = logits.squeeze(0).map_err(InferenceError::from)?;
+                        .forward(&prompt_tensor, 0)
+                        .map_err(InferenceError::from)?; // [1, vocab_size]
+                    let logits = logits.squeeze(0).map_err(InferenceError::from)?; // [vocab_size]
 
-                    next_token = logits_processor
+                    let mut next_token = logits_processor
                         .sample(&logits)
                         .map_err(InferenceError::from)?;
-                    pos += 1;
-                }
-                let decode_secs = decode_start.elapsed().as_secs_f64();
 
-                if !generated.is_empty() && decode_secs > 0.0 {
-                    let tps = generated.len() as f64 / decode_secs;
-                    self.last_decode_tps.store(tps.to_bits(), Ordering::Relaxed);
-                }
+                    let mut generated: Vec<u32> = Vec::new();
+                    let mut pos = prompt_len;
 
-                debug!(
-                    "generate() GGUF handle {}: {} tokens in {:.2}s ({:.1} tok/s)",
-                    handle.id(),
-                    generated.len(),
-                    decode_secs,
-                    if decode_secs > 0.0 {
-                        generated.len() as f64 / decode_secs
-                    } else {
-                        0.0
-                    },
-                );
+                    // Decode loop: feed one token at a time, sample the next.
+                    let decode_start = std::time::Instant::now();
+                    loop {
+                        if stop_ids.contains(&next_token) || generated.len() >= MAX_NEW_TOKENS {
+                            break;
+                        }
+                        generated.push(next_token);
 
-                guard.tokenizer.decode(&generated)?
-            }
+                        let text_output = guard.tokenizer.decode(&generated)?;
 
-            // ── Full-precision SafeTensors path ───────────────────────────────
-            LoadedWeights::SafeTensors(m) => {
-                let guard = m.lock().unwrap();
+                        yield crate::InferenceStream::Text(text_output);
 
-                // Encode prompt.
-                let mut prompt_tokens = guard.tokenizer.encode(prompt)?;
-                let eos_id = guard.tokenizer.eos_token_id();
-                let bos_id = guard.tokenizer.bos_token_id();
+                        let token_tensor = Tensor::new(&[next_token], &self.device)
+                            .map_err(InferenceError::from)?
+                            .unsqueeze(0)
+                            .map_err(InferenceError::from)?; // [1, 1]
 
-                // Only add BOS when it differs from EOS (same guard as GGUF path).
-                if let Some(bos) = bos_id {
-                    if Some(bos) != eos_id {
-                        prompt_tokens.insert(0, bos);
+                        let logits = guard
+                            .weights
+                            .forward(&token_tensor, pos)
+                            .map_err(InferenceError::from)?;
+                        let logits = logits.squeeze(0).map_err(InferenceError::from)?;
+
+                        next_token = logits_processor
+                            .sample(&logits)
+                            .map_err(InferenceError::from)?;
+                        pos += 1;
                     }
-                }
-                let prompt_len = prompt_tokens.len();
+                    let decode_secs = decode_start.elapsed().as_secs_f64();
 
-                // Build the full stop-token set.
-                let mut stop_ids: Vec<u32> = eos_id.into_iter().collect();
-                for candidate in &["<|im_end|>", "<|eot_id|>", "<|end_of_text|>"] {
-                    if let Some(id) = guard.tokenizer.token_to_id(candidate) {
-                        if !stop_ids.contains(&id) {
-                            stop_ids.push(id);
+                    if !generated.is_empty() && decode_secs > 0.0 {
+                        let tps = generated.len() as f64 / decode_secs;
+                        self.last_decode_tps.store(tps.to_bits(), Ordering::Relaxed);
+                    }
+
+                    let text_output =  format!(
+                        "generate() GGUF handle {}: {} tokens in {:.2}s ({:.1} tok/s)",
+                        handle.id(),
+                        generated.len(),
+                        decode_secs,
+                        if decode_secs > 0.0 {
+                            generated.len() as f64 / decode_secs
+                        } else {
+                            0.0
+                        },
+                    );
+
+                    yield crate::InferenceStream::Finished(text_output)
+                }
+
+                // ── Full-precision SafeTensors path ───────────────────────────────
+                LoadedWeights::SafeTensors(m) => {
+                    let guard = m.lock().await;
+
+                    // Encode prompt.
+                    let mut prompt_tokens = guard.tokenizer.encode(prompt)?;
+                    let eos_id = guard.tokenizer.eos_token_id();
+                    let bos_id = guard.tokenizer.bos_token_id();
+
+                    // Only add BOS when it differs from EOS (same guard as GGUF path).
+                    if let Some(bos) = bos_id {
+                        if Some(bos) != eos_id {
+                            prompt_tokens.insert(0, bos);
                         }
                     }
-                }
+                    let prompt_len = prompt_tokens.len();
 
-                info!(
-                    "generate() SafeTensors handle {}: {} prompt tokens, stop={:?}",
-                    handle.id(),
-                    prompt_len,
-                    stop_ids,
-                );
-
-                // Create a fresh KV-cache for this generation session.
-                let mut cache = Cache::new(true, DType::F16, &guard.llama_config, &self.device)
-                    .map_err(InferenceError::from)?;
-
-                // Prefill.
-                let prompt_tensor = Tensor::new(prompt_tokens.as_slice(), &self.device)
-                    .map_err(InferenceError::from)?
-                    .unsqueeze(0)
-                    .map_err(InferenceError::from)?; // [1, prompt_len]
-
-                let logits = guard
-                    .model
-                    .forward(&prompt_tensor, 0, &mut cache)
-                    .map_err(InferenceError::from)?; // [1, vocab_size]
-                let logits = logits.squeeze(0).map_err(InferenceError::from)?; // [vocab_size]
-
-                let mut next_token = logits_processor
-                    .sample(&logits)
-                    .map_err(InferenceError::from)?;
-
-                let mut generated: Vec<u32> = Vec::new();
-                let mut pos = prompt_len;
-
-                // Decode loop.
-                let decode_start = std::time::Instant::now();
-                loop {
-                    if stop_ids.contains(&next_token) || generated.len() >= MAX_NEW_TOKENS {
-                        break;
+                    // Build the full stop-token set.
+                    let mut stop_ids: Vec<u32> = eos_id.into_iter().collect();
+                    for candidate in &["<|im_end|>", "<|eot_id|>", "<|end_of_text|>"] {
+                        if let Some(id) = guard.tokenizer.token_to_id(candidate) {
+                            if !stop_ids.contains(&id) {
+                                stop_ids.push(id);
+                            }
+                        }
                     }
-                    generated.push(next_token);
 
-                    let token_tensor = Tensor::new(&[next_token], &self.device)
+                    info!(
+                        "generate() SafeTensors handle {}: {} prompt tokens, stop={:?}",
+                        handle.id(),
+                        prompt_len,
+                        stop_ids,
+                    );
+
+                    // Create a fresh KV-cache for this generation session.
+                    let mut cache = Cache::new(true, DType::F16, &guard.llama_config, &self.device)
+                        .map_err(InferenceError::from)?;
+
+                    // Prefill.
+                    let prompt_tensor = Tensor::new(prompt_tokens.as_slice(), &self.device)
                         .map_err(InferenceError::from)?
                         .unsqueeze(0)
-                        .map_err(InferenceError::from)?; // [1, 1]
+                        .map_err(InferenceError::from)?; // [1, prompt_len]
 
                     let logits = guard
                         .model
-                        .forward(&token_tensor, pos, &mut cache)
-                        .map_err(InferenceError::from)?;
-                    let logits = logits.squeeze(0).map_err(InferenceError::from)?;
+                        .forward(&prompt_tensor, 0, &mut cache)
+                        .map_err(InferenceError::from)?; // [1, vocab_size]
+                    let logits = logits.squeeze(0).map_err(InferenceError::from)?; // [vocab_size]
 
-                    next_token = logits_processor
+                    let mut next_token = logits_processor
                         .sample(&logits)
                         .map_err(InferenceError::from)?;
-                    pos += 1;
+
+                    let mut generated: Vec<u32> = Vec::new();
+                    let mut pos = prompt_len;
+
+                    // Decode loop.
+                    let decode_start = std::time::Instant::now();
+                    loop {
+                        if stop_ids.contains(&next_token) || generated.len() >= MAX_NEW_TOKENS {
+                            break;
+                        }
+                        generated.push(next_token);
+
+                        let token_tensor = Tensor::new(&[next_token], &self.device)
+                            .map_err(InferenceError::from)?
+                            .unsqueeze(0)
+                            .map_err(InferenceError::from)?; // [1, 1]
+
+                        let logits = guard
+                            .model
+                            .forward(&token_tensor, pos, &mut cache)
+                            .map_err(InferenceError::from)?;
+                        let logits = logits.squeeze(0).map_err(InferenceError::from)?;
+
+                        next_token = logits_processor
+                            .sample(&logits)
+                            .map_err(InferenceError::from)?;
+                        pos += 1;
+                    }
+                    let decode_secs = decode_start.elapsed().as_secs_f64();
+
+                    if !generated.is_empty() && decode_secs > 0.0 {
+                        let tps = generated.len() as f64 / decode_secs;
+                        self.last_decode_tps.store(tps.to_bits(), Ordering::Relaxed);
+                    }
+
+                    let text_output = format!(
+                        "generate() SafeTensors handle {}: {} tokens in {:.2}s ({:.1} tok/s)",
+                        handle.id(),
+                        generated.len(),
+                        decode_secs,
+                        if decode_secs > 0.0 {
+                            generated.len() as f64 / decode_secs
+                        } else {
+                            0.0
+                        },
+                    );
+
+                    yield crate::InferenceStream::Finished(text_output)
                 }
-                let decode_secs = decode_start.elapsed().as_secs_f64();
-
-                if !generated.is_empty() && decode_secs > 0.0 {
-                    let tps = generated.len() as f64 / decode_secs;
-                    self.last_decode_tps.store(tps.to_bits(), Ordering::Relaxed);
-                }
-
-                debug!(
-                    "generate() SafeTensors handle {}: {} tokens in {:.2}s ({:.1} tok/s)",
-                    handle.id(),
-                    generated.len(),
-                    decode_secs,
-                    if decode_secs > 0.0 {
-                        generated.len() as f64 / decode_secs
-                    } else {
-                        0.0
-                    },
-                );
-
-                guard.tokenizer.decode(&generated)?
             }
-        };
-
-        Ok(text)
+        }
     }
 
     fn unload(&mut self, handle: ModelHandle) -> InferenceResult<()> {
@@ -716,10 +739,12 @@ mod tests {
 
     #[test]
     fn test_invalid_handle_error() {
-        let engine = InferenceEngine::new(EngineConfig::default()).unwrap();
-        let handle = ModelHandle::new(999);
-        let result = engine.benchmark(&handle, 5);
-        assert!(matches!(result, Err(InferenceError::InvalidHandle(999))));
+        smol::block_on(async move {
+            let engine = InferenceEngine::new(EngineConfig::default()).unwrap();
+            let handle = ModelHandle::new(999);
+            let result = engine.benchmark(&handle, 5).await;
+            assert!(matches!(result, Err(InferenceError::InvalidHandle(999))));
+        });
     }
 
     #[test]

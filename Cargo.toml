@@ -13,9 +13,11 @@ harness = false
 name = "inference_bench"
 
 [dependencies]
+async-dup = "1.2.4"
+async-lock = "3.4.2"
+async-stream = "0.3.6"
 async-trait = { version = "0.1.91" }
-# Async
-tokio = { version = "1.53.1" }
+futures-lite = "2.6.1"
 
 # ML
 candle-core = { version = "0.11.0" }
@@ -40,6 +42,7 @@ tracing = { version = "0.1.44" }
 criterion = { version = "0.8.2" }
 dirs = "6"
 safetensors = "0.8.0"
+smol = "2.0.2"
 tokio-test = "0.4"
 tracing-subscriber = { version = "0.3.23" }
 
