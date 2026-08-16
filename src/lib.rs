@@ -72,6 +72,7 @@ pub trait InferenceProvider: Send + Sync {
         &self,
         handle: &ModelHandle,
         prompt: &str,
+        max_new_tokens: usize,
     ) -> impl Future<Output = impl Stream<Item = InferenceResult<InferenceStream>> + Send>;
 
     /// Unload a model to free memory

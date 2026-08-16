@@ -443,11 +443,11 @@ impl InferenceProvider for InferenceEngine {
         &self,
         handle: &ModelHandle,
         prompt: &str,
+        max_new_tokens: usize,
     ) -> impl Stream<Item = InferenceResult<crate::InferenceStream>> + Send {
         try_stream! {
             /// Maximum new tokens to generate per call.
-            const MAX_NEW_TOKENS: usize = 256;
-            /// Sampling temperature (0 → greedy, higher → more random).
+           /// Sampling temperature (0 → greedy, higher → more random).
             const TEMPERATURE: f64 = 0.8;
 
             let entry = self
@@ -518,7 +518,7 @@ impl InferenceProvider for InferenceEngine {
                     // Decode loop: feed one token at a time, sample the next.
                     let decode_start = std::time::Instant::now();
                     loop {
-                        if stop_ids.contains(&next_token) || generated.len() >= MAX_NEW_TOKENS {
+                        if stop_ids.contains(&next_token) || generated.len() >= max_new_tokens {
                             break;
                         }
                         generated.push(next_token);
@@ -625,7 +625,7 @@ impl InferenceProvider for InferenceEngine {
                     // Decode loop.
                     let decode_start = std::time::Instant::now();
                     loop {
-                        if stop_ids.contains(&next_token) || generated.len() >= MAX_NEW_TOKENS {
+                        if stop_ids.contains(&next_token) || generated.len() >= max_new_tokens {
                             break;
                         }
                         generated.push(next_token);
